@@ -1,0 +1,330 @@
+#!/usr/bin/env python3
+"""
+Linux-Process-Mon :: resident process collector.
+
+A single `--serve` daemon (systemd --user service, pinned to the E-cores) reads
+/proc once per interval and writes a compact process snapshot to
+$XDG_RUNTIME_DIR/Linux-Process-Mon/data.json. The widget reads that file
+in-process via XHR (no per-poll process spawn), builds the parent/child tree and
+renders the table.
+
+Per row: name, ppid (for the tree), CPU% (per-core, htop-style), RSS bytes,
+thread count, PID, disk I/O (bytes/s, own processes only -- /proc/<pid>/io is
+not readable for other users without root), and the NVIDIA per-process figures
+from `nvidia-smi pmon`: GPU (SM) %, encoder %, decoder %, VRAM bytes.
+
+Summable metrics also get an a* field = self + every descendant (subtree total).
+
+Modes:
+  procmon-collect --serve      resident: refresh the snapshot every interval
+  procmon-collect --snapshot   print the cached snapshot (debug / fallback)
+  procmon-collect --once       one sample to stdout (debug)
+"""
+import os, sys, json, time, glob, shutil, subprocess
+
+APP = "Linux-Process-Mon"
+RUNDIR = os.path.join(os.environ.get("XDG_RUNTIME_DIR", "/tmp"), APP)
+DATA = os.path.join(RUNDIR, "data.json")
+CONFIG = os.path.expanduser(f"~/.config/{APP}/config.json")
+
+CLK = os.sysconf("SC_CLK_TCK")
+PAGE = os.sysconf("SC_PAGE_SIZE")
+NCPU = os.cpu_count() or 1
+
+# metrics aggregated up the tree (self + descendants); pid/ppid are not summed
+SUM_KEYS = ["cpu", "ram", "gpu", "dec", "enc", "vram", "disk", "threads"]
+
+
+# ---- process -> icon resolution (from the .desktop database, cached) ----
+DESKTOP_DIRS = [
+    "/usr/share/applications", "/usr/local/share/applications",
+    os.path.expanduser("~/.local/share/applications"),
+    "/var/lib/flatpak/exports/share/applications",
+    os.path.expanduser("~/.local/share/flatpak/exports/share/applications"),
+]
+# branded apps whose process name doesn't match any .desktop key
+ICON_ALIASES = {
+    "chrome": "google-chrome", "chromium": "chromium", "msedge": "microsoft-edge",
+    "brave": "brave-browser", "code-oss": "code-oss", "codium": "vscodium",
+    "firefox-bin": "firefox", "thunderbird-bin": "thunderbird",
+    "steamwebhelper": "steam", "wineserver": "wine", "telegram-desktop": "telegram",
+}
+_EXEC_SKIP = {"env", "flatpak", "sh", "bash", "run", "--", "gtk-launch"}
+# generic runtimes/interpreters: the comm doesn't identify the app, so a .desktop
+# match would be a coincidence (python3 -> some random app's icon). Skip them.
+GENERIC_COMMS = {
+    "python", "python2", "python3", "node", "nodejs", "java", "electron",
+    "sh", "bash", "dash", "zsh", "fish", "perl", "ruby", "mono", "dotnet",
+    "wrapper", "lua", "php", "deno", "bun",
+}
+
+_icon_map = None
+_icon_map_when = 0.0
+_icon_resolved = {}                                        # comm -> icon name (cache)
+
+
+def _parse_desktop(path):
+    icon = exe = tryexe = wm = ""
+    in_entry = False
+    try:
+        for ln in open(path, encoding="utf-8", errors="ignore"):
+            ln = ln.strip()
+            if ln.startswith("["):
+                in_entry = (ln == "[Desktop Entry]")
+                continue
+            if not in_entry or "=" not in ln:
+                continue
+            k, _, v = ln.partition("=")
+            v = v.strip()
+            if k == "Icon" and not icon: icon = v
+            elif k == "Exec" and not exe: exe = v
+            elif k == "TryExec" and not tryexe: tryexe = v
+            elif k == "StartupWMClass" and not wm: wm = v
+    except OSError:
+        return None
+    return icon, exe, tryexe, wm
+
+
+def _exec_basename(exe):
+    for t in exe.split():
+        if not t or t.startswith("%") or t.startswith("-") or "=" in t.split("/")[0]:
+            continue
+        b = os.path.basename(t)
+        if b and b not in _EXEC_SKIP:
+            return b
+    return ""
+
+
+def build_icon_map():
+    m = {}
+    for d in DESKTOP_DIRS:
+        for path in glob.glob(os.path.join(d, "*.desktop")):
+            r = _parse_desktop(path)
+            if not r or not r[0]:
+                continue
+            icon, exe, tryexe, wm = r
+            keys = {os.path.basename(path)[:-8].lower()}   # file stem
+            if exe:
+                b = _exec_basename(exe)
+                if b: keys.add(b.lower())
+            if tryexe:
+                keys.add(os.path.basename(tryexe).lower())
+            if wm:
+                keys.add(wm.lower())
+            for k in keys:
+                m.setdefault(k, icon)
+    return m
+
+
+def resolve_icon(comm):
+    global _icon_map, _icon_map_when
+    now = time.time()
+    if _icon_map is None or now - _icon_map_when > 300:     # rescan occasionally
+        _icon_map = build_icon_map(); _icon_map_when = now; _icon_resolved.clear()
+    if comm in _icon_resolved:
+        return _icon_resolved[comm]
+    c = comm.lower()
+    icon = ICON_ALIASES.get(c) or ("" if c in GENERIC_COMMS else _icon_map.get(c, "")) or ""
+    _icon_resolved[comm] = icon
+    return icon
+
+
+def load_config():
+    try:
+        with open(CONFIG) as f:
+            return json.load(f)
+    except Exception:
+        return {}
+
+
+def read_procs():
+    """pid -> {comm, ppid, t (cpu ticks), rss bytes, threads}."""
+    out = {}
+    for pid in os.listdir("/proc"):
+        if not pid.isdigit():
+            continue
+        try:
+            with open(f"/proc/{pid}/stat") as f:
+                line = f.read()
+            l = line.index("(")
+            r = line.rindex(")")
+            comm = line[l + 1:r]
+            rest = line[r + 2:].split()                    # field 3 (state) onward
+            out[int(pid)] = {
+                "comm": comm,
+                "ppid": int(rest[1]),                      # field 4
+                "t": int(rest[11]) + int(rest[12]),        # utime + stime (14,15)
+                "rss": int(rest[21]) * PAGE,               # field 24 (pages)
+                "threads": int(rest[17]),                  # field 20
+            }
+        except Exception:
+            continue                                       # process vanished / unreadable
+    return out
+
+
+def read_io():
+    """pid -> cumulative read+write bytes (own processes only; others raise)."""
+    out = {}
+    for pid in os.listdir("/proc"):
+        if not pid.isdigit():
+            continue
+        try:
+            tot = 0
+            with open(f"/proc/{pid}/io") as f:
+                for ln in f:
+                    if ln.startswith(("read_bytes:", "write_bytes:")):
+                        tot += int(ln.split()[1])
+            out[int(pid)] = tot
+        except Exception:
+            continue
+    return out
+
+
+def gpu_usage():
+    """pid -> {gpu, enc, dec (%), vram (bytes)} from nvidia-smi pmon (best-effort).
+    Parses the header line so column order can't bite us."""
+    exe = shutil.which("nvidia-smi")
+    if not exe:
+        return {}
+    try:
+        out = subprocess.run([exe, "pmon", "-c", "1", "-s", "um"],
+                             capture_output=True, text=True, timeout=8).stdout
+    except Exception:
+        return {}
+    cols, res = None, {}
+    for line in out.splitlines():
+        s = line.strip()
+        if not s:
+            continue
+        if s.startswith("#"):
+            parts = s.lstrip("#").split()
+            if "pid" in parts:
+                cols = parts                               # the names header
+            continue
+        if cols is None:
+            continue
+        row = dict(zip(cols, s.split()))
+        try:
+            pid = int(row.get("pid", ""))
+        except ValueError:
+            continue
+
+        def num(k):
+            v = row.get(k, "-")
+            return int(v) if v.isdigit() else 0
+        res[pid] = {"gpu": num("sm"), "enc": num("enc"), "dec": num("dec"),
+                    "vram": num("fb") * 1024 * 1024}       # fb is MB
+    return res
+
+
+_prev = {"t": {}, "io": {}, "when": None}
+
+
+def build():
+    now = time.time()
+    procs = read_procs()
+    io = read_io()
+    gpu = gpu_usage()
+    dt = (now - _prev["when"]) if _prev["when"] else 0
+    pt, pio = _prev["t"], _prev["io"]
+    rows = []
+    for pid, p in procs.items():
+        cpu = 0.0
+        if dt > 0 and pid in pt:
+            # % of total system (divided by core count), matching btop/system monitor
+            cpu = max(0.0, (p["t"] - pt[pid]) / CLK / dt * 100.0 / NCPU)
+        disk = 0.0
+        if dt > 0 and pid in io and pid in pio:
+            disk = max(0.0, (io[pid] - pio[pid]) / dt)
+        g = gpu.get(pid, {})
+        rows.append({
+            "pid": pid, "ppid": p["ppid"], "name": p["comm"], "icon": resolve_icon(p["comm"]),
+            "cpu": round(cpu, 1), "ram": p["rss"], "threads": p["threads"],
+            "gpu": g.get("gpu", 0), "enc": g.get("enc", 0), "dec": g.get("dec", 0),
+            "vram": g.get("vram", 0), "disk": round(disk),
+            "kernel": pid == 2 or p["ppid"] == 2,
+        })
+    aggregate(rows)
+    _prev["t"] = {pid: p["t"] for pid, p in procs.items()}
+    _prev["io"] = io
+    _prev["when"] = now
+    return {"ts": now, "ncpu": NCPU, "procs": rows}
+
+
+def aggregate(rows):
+    """Add a<metric> = self + every descendant for each SUM_KEYS metric. RSS/VRAM
+    sums overcount shared pages a little, but it's the useful 'whole subtree'
+    number."""
+    by = {r["pid"]: r for r in rows}
+    kids = {}
+    for r in rows:
+        kids.setdefault(r["ppid"], []).append(r["pid"])
+        for k in SUM_KEYS:
+            r["a" + k] = r[k]
+    roots = [r["pid"] for r in rows if r["ppid"] not in by]
+    seen, order, stack = set(), [], [(pid, False) for pid in roots]
+    while stack:
+        pid, done = stack.pop()
+        if done:
+            order.append(pid); continue
+        if pid in seen:
+            continue
+        seen.add(pid)
+        stack.append((pid, True))
+        for c in kids.get(pid, []):
+            if c not in seen:
+                stack.append((c, False))
+    for pid in order:
+        r = by[pid]
+        for c in kids.get(pid, []):
+            cr = by.get(c)
+            if cr:
+                for k in SUM_KEYS:
+                    r["a" + k] += cr["a" + k]
+    for r in rows:
+        r["acpu"] = round(r["acpu"], 1)
+
+
+def write_snapshot(snap):
+    os.makedirs(RUNDIR, exist_ok=True)
+    tmp = DATA + ".tmp"
+    with open(tmp, "w") as f:
+        json.dump(snap, f)
+    os.replace(tmp, DATA)
+
+
+def cmd_serve():
+    build()                                                # prime CPU/disk deltas
+    time.sleep(0.5)                                        # real delta before first write
+    write_snapshot(build())
+    while True:
+        interval = float(load_config().get("poll_interval", 2))
+        time.sleep(max(0.5, interval))
+        try:
+            write_snapshot(build())
+        except Exception as e:
+            sys.stderr.write(f"procmon-collect: {e}\n")
+
+
+def cmd_once():
+    build()
+    time.sleep(0.4)
+    json.dump(build(), sys.stdout)
+    sys.stdout.write("\n")
+
+
+def cmd_snapshot():
+    try:
+        sys.stdout.write(open(DATA).read())
+    except Exception:
+        sys.stdout.write('{"ts":0,"ncpu":1,"procs":[]}')
+
+
+def main():
+    arg = sys.argv[1] if len(sys.argv) > 1 else "--once"
+    return {"--serve": cmd_serve, "--snapshot": cmd_snapshot,
+            "--once": cmd_once}.get(arg, cmd_once)()
+
+
+if __name__ == "__main__":
+    sys.exit(main() or 0)
