@@ -156,7 +156,19 @@ PlasmoidItem {
         onTriggered: root.read()
     }
     onExpandedChanged: if (expanded) read()
-    Component.onCompleted: pathHelper.connectSource("printf %s \"$XDG_RUNTIME_DIR/Linux-Process-Mon/data.json\"")
+    Component.onCompleted: {
+        pathHelper.connectSource("printf %s \"$XDG_RUNTIME_DIR/Linux-Process-Mon/data.json\"")
+        applyInterval()
+    }
+    // keep the collector's sample rate in lock-step with the refresh interval
+    function applyInterval() {
+        root.run("$HOME/.local/bin/procmon-collect --set-interval "
+            + (Math.max(500, Plasmoid.configuration.updateInterval) / 1000))
+    }
+    Connections {
+        target: Plasmoid.configuration
+        function onUpdateIntervalChanged() { root.applyInterval() }
+    }
 
     // ---- process actions (right-click menu) ----
     function shq(s) { return "'" + String(s).replace(/'/g, "'\\''") + "'" }

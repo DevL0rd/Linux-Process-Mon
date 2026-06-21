@@ -297,13 +297,34 @@ def cmd_serve():
     build()                                                # prime CPU/disk deltas
     time.sleep(0.5)                                        # real delta before first write
     write_snapshot(build())
+    last = time.time()
     while True:
-        interval = float(load_config().get("poll_interval", 2))
-        time.sleep(max(0.5, interval))
-        try:
-            write_snapshot(build())
-        except Exception as e:
-            sys.stderr.write(f"procmon-collect: {e}\n")
+        # re-read config every loop so a new poll_interval applies within ~0.2s
+        interval = max(0.25, float(load_config().get("poll_interval", 2)))
+        elapsed = time.time() - last
+        if elapsed >= interval:
+            last = time.time()
+            try:
+                write_snapshot(build())
+            except Exception as e:
+                sys.stderr.write(f"procmon-collect: {e}\n")
+        else:
+            time.sleep(min(0.2, interval - elapsed))
+
+
+def cmd_set_interval():
+    if len(sys.argv) < 3:
+        return 1
+    try:
+        v = max(0.25, float(sys.argv[2]))
+    except ValueError:
+        return 1
+    cfg = load_config()
+    cfg["poll_interval"] = v
+    os.makedirs(os.path.dirname(CONFIG), exist_ok=True)
+    with open(CONFIG, "w") as f:
+        json.dump(cfg, f, indent=2)
+    return 0
 
 
 def cmd_once():
@@ -323,7 +344,7 @@ def cmd_snapshot():
 def main():
     arg = sys.argv[1] if len(sys.argv) > 1 else "--once"
     return {"--serve": cmd_serve, "--snapshot": cmd_snapshot,
-            "--once": cmd_once}.get(arg, cmd_once)()
+            "--set-interval": cmd_set_interval, "--once": cmd_once}.get(arg, cmd_once)()
 
 
 if __name__ == "__main__":
