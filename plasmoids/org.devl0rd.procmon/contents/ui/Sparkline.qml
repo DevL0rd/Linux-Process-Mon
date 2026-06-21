@@ -51,7 +51,7 @@ Item {
         id: canvas
         anchors.fill: parent
         renderTarget: Canvas.FramebufferObject       // rasterise on the GPU
-        renderStrategy: Canvas.Cooperative
+        renderStrategy: Canvas.Threaded              // ...off the main/UI thread
         property var lastVals: []
         onPaint: {
             var ctx = getContext("2d")

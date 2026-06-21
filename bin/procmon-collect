@@ -42,6 +42,9 @@ except OSError:
 
 # metrics aggregated up the tree (self + descendants); pid/ppid are not summed
 SUM_KEYS = ["cpu", "ram", "gpu", "dec", "enc", "vram", "disk", "threads"]
+# metric fields dropped from the JSON when zero (the widget defaults them back to
+# 0) -- shrinks the snapshot a lot since most processes are idle on most metrics
+_OMIT0 = SUM_KEYS + ["a" + k for k in SUM_KEYS]
 
 
 # ---- process -> icon resolution (from the .desktop database, cached) ----
@@ -273,6 +276,7 @@ def build():
             "kernel": pid == 2 or p["ppid"] == 2,
         })
     aggregate(rows)
+    compact(rows)
     _prev["t"] = {pid: p["t"] for pid, p in procs.items()}
     _prev["io"] = io
     _prev["when"] = now
@@ -312,6 +316,20 @@ def aggregate(rows):
                     r["a" + k] += cr["a" + k]
     for r in rows:
         r["acpu"] = round(r["acpu"], 1)
+
+
+def compact(rows):
+    """Strip zero/empty fields so the snapshot JSON stays small. The widget reads
+    every metric as `value || 0`, a missing icon falls back to the name, and a
+    missing `kernel` reads as non-kernel -- so this is invisible to the UI."""
+    for r in rows:
+        for k in _OMIT0:
+            if r.get(k) == 0:
+                del r[k]
+        if not r.get("icon"):
+            r.pop("icon", None)
+        if not r.get("kernel"):
+            r.pop("kernel", None)
 
 
 def write_snapshot(snap):

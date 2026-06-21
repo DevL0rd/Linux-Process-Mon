@@ -18,6 +18,7 @@ import org.kde.kirigami as Kirigami
 import org.kde.plasma.components as PlasmaComponents
 import org.kde.plasma.plasmoid
 import org.kde.plasma.plasma5support as P5Support
+import QtQml.WorkerScript
 
 PlasmoidItem {
     id: root
@@ -47,13 +48,15 @@ PlasmoidItem {
     readonly property var columns: allColumns.filter(function(c) { return c.show })
 
     // ---- data ----
-    property var procs: []
-    property int ncpu: 1
+    // The heavy pipeline (parse + history rings + tree-walk) runs OFF the GUI
+    // thread in proc.worker.mjs; it hands back the flat row list plus per-PID
+    // proc data + sort-column history for the rows it produced. The GUI thread
+    // only reconciles the ListModel and formats the visible cells.
     property real memTotal: 0             // system RAM total -> RAM sparkline max
     property real vramTotal: 0            // GPU VRAM total -> VRAM sparkline max
-    property var byPid: ({})
-    property var childrenOf: ({})
     property var expanded: ({})           // pid -> true when expanded (default: collapsed)
+    property var procByPid: ({})          // pid -> proc, for the rows currently shown
+    property var sortHistByPid: ({})      // pid -> sort-column history array (linearised)
 
     // the visible rows live in a ListModel that is reconciled in place each poll
     // (insert/move/set/remove keyed by pid) so delegates PERSIST and only changed
@@ -61,13 +64,8 @@ PlasmoidItem {
     ListModel { id: rowModel }
     property var rowsViewRef: null        // ListView ref (read-only, for scroll state)
 
-    // per-PID metric history, accumulated for EVERY process each poll (data layer,
-    // independent of what's rendered) so a row's sparkline is complete the moment
-    // it scrolls into view
-    property var hist: ({})               // pid -> { metric: [values...] }
     readonly property int histLen: 40
     readonly property var histKeys: ["cpu", "ram", "gpu", "dec", "enc", "vram", "disk", "threads"]
-    function histFor(pid, col) { var h = root.hist[pid]; return (h && h[col]) ? h[col] : [] }
     // each metric's natural ceiling: CPU/GPU/DEC/ENC = 100, RAM = total RAM,
     // VRAM = total VRAM, disk/threads = auto-scale
     function graphMax(col) {
@@ -83,9 +81,9 @@ PlasmoidItem {
     property bool showKernel: Plasmoid.configuration.showKernelThreads
     property bool aggregate: Plasmoid.configuration.aggregateChildren
     property bool hideSystemd: Plasmoid.configuration.hideSystemd
-    onAggregateChanged: rebuild()
-    onHideSystemdChanged: rebuild()
-    onColumnsChanged: rebuild()
+    onAggregateChanged: requestRebuild()
+    onHideSystemdChanged: requestRebuild()
+    onColumnsChanged: requestRebuild()
 
     function colVal(p, c) {
         if (c.noagg) return p[c.key] || 0
@@ -93,7 +91,6 @@ PlasmoidItem {
         return p[c.key] || 0
     }
     function colOf(key) { for (var i = 0; i < allColumns.length; i++) if (allColumns[i].key === key) return allColumns[i]; return null }
-    function isHidden(p) { return root.hideSystemd && (p.pid === 1 || p.name === "systemd") }
 
     function fmtBytes(b) {
         if (b >= 1073741824) return (b / 1073741824).toFixed(1) + " GB"
@@ -129,48 +126,45 @@ PlasmoidItem {
         xhr.onreadystatechange = function() {
             if (xhr.readyState !== XMLHttpRequest.DONE) return
             if (!xhr.responseText) return
-            try { root.ingest(JSON.parse(xhr.responseText)) } catch (e) {}
+            worker.sendMessage({ text: xhr.responseText, state: root.workerState() })
         }
         xhr.send()
     }
-    function ingest(d) {
-        var ps = d.procs || []
-        var bp = {}, ch = {}
-        for (var i = 0; i < ps.length; i++) bp[ps[i].pid] = ps[i]
-        for (var j = 0; j < ps.length; j++) {
-            var q = ps[j]
-            ;(ch[q.ppid] = ch[q.ppid] || []).push(q.pid)
+    // UI-state snapshot the worker needs to walk the tree (the parse stays cached
+    // worker-side, so sort/search/expand only re-walk -- no re-parse)
+    function workerState() {
+        var def = root.colOf(root.sortColumn)
+        return {
+            histKeys: root.histKeys, histLen: root.histLen, aggregate: root.aggregate,
+            sortColumn: root.sortColumn, sortNoagg: def ? !!def.noagg : true,
+            sortDescending: root.sortDescending, searchText: root.searchText,
+            showKernel: root.showKernel, hideSystemd: root.hideSystemd, expanded: root.expanded
         }
-        root.ncpu = d.ncpu || 1
-        root.memTotal = d.mem_total || 0
-        root.vramTotal = d.vram_total || 0
-        root.procs = ps; root.byPid = bp; root.childrenOf = ch
-        // accumulate history for every process (aggregate-aware), dropping dead PIDs
-        var keys = root.histKeys
-        var defs = keys.map(function(kk) { return root.colOf(kk) })
-        var nh = {}
-        for (var k = 0; k < ps.length; k++) {
-            var pp = ps[k]
-            var prev = root.hist[pp.pid]
-            var hh = {}
-            for (var m = 0; m < keys.length; m++) {
-                var arr = (prev && prev[keys[m]]) ? prev[keys[m]].slice() : []
-                arr.push(root.colVal(pp, defs[m]))
-                if (arr.length > root.histLen) arr.shift()
-                hh[keys[m]] = arr
-            }
-            nh[pp.pid] = hh
+    }
+    function requestRebuild() { worker.sendMessage({ text: null, state: root.workerState() }) }
+
+    WorkerScript {
+        id: worker
+        source: Qt.resolvedUrl("proc.worker.mjs")
+        onMessage: function(msg) {
+            root.memTotal = msg.memTotal
+            root.vramTotal = msg.vramTotal
+            root.procByPid = msg.procByPid
+            root.sortHistByPid = msg.sortHistByPid
+            var lv = root.rowsViewRef
+            // re-sort/reorder only while at the top; freeze the order when scrolled
+            if (!lv || lv.contentY < Kirigami.Units.gridUnit * 1.7)
+                root.syncModel(msg.desired)
+            else
+                root.syncFrozen(msg.desired)
         }
-        root.hist = nh
-        rebuild()
     }
     Timer {
         interval: Math.max(500, Plasmoid.configuration.updateInterval)
         repeat: true
-        running: root.expanded
+        running: true
         onTriggered: root.read()
     }
-    onExpandedChanged: if (expanded) read()
     Component.onCompleted: {
         pathHelper.connectSource("printf %s \"$XDG_RUNTIME_DIR/Linux-Process-Mon/data.json\"")
         applyInterval()
@@ -210,54 +204,12 @@ PlasmoidItem {
         root.run("bash -c " + shq("p=" + pid + "; mapfile -d '' a < /proc/$p/cmdline; cwd=$(readlink /proc/$p/cwd); kill \"$p\"; cd \"$cwd\" 2>/dev/null; setsid \"${a[@]}\" >/dev/null 2>&1 &"))
     }
 
-    // ---- tree -> flat visible rows ----
-    function sortVal(p) {
-        if (root.sortColumn === "name") return (p.name || "").toLowerCase()
-        var c = root.colOf(root.sortColumn)
-        return c ? root.colVal(p, c) : (p[root.sortColumn] || 0)
-    }
-    function cmp(a, b) {
-        var av = root.sortVal(a), bv = root.sortVal(b)
-        var r = av < bv ? -1 : (av > bv ? 1 : 0)
-        return root.sortDescending ? -r : r
-    }
-    function passes(p) { return p && (root.showKernel || !p.kernel) }
-    function displayRoot(p) {
-        if (!root.passes(p) || root.isHidden(p)) return false
-        var par = root.byPid[p.ppid]
-        return par === undefined || root.isHidden(par) || !root.passes(par)
-    }
-    function rebuild() {
-        // build the desired flat list of visible rows (pid + tree fields only;
-        // the proc data is looked up live in the delegate via byPid)
-        var desired = []
-        if (root.searchText !== "") {
-            var ql = root.searchText.toLowerCase()
-            var m = root.procs.filter(function(p) { return root.passes(p) && (p.name || "").toLowerCase().indexOf(ql) >= 0 })
-            m.sort(root.cmp)
-            for (var i = 0; i < m.length; i++)
-                desired.push({ pid: m[i].pid, depth: 0, hasChildren: false, expanded: false })
-        } else {
-            var rl = root.procs.filter(root.displayRoot)
-            rl.sort(root.cmp)
-            var walk = function(p, depth) {
-                var kids = (root.childrenOf[p.pid] || []).map(function(pid) { return root.byPid[pid] })
-                    .filter(function(k) { return k && root.passes(k) && !root.isHidden(k) })
-                var has = kids.length > 0
-                var exp = root.expanded[p.pid] === true
-                desired.push({ pid: p.pid, depth: depth, hasChildren: has, expanded: exp })
-                if (has && exp) { kids.sort(root.cmp); for (var i = 0; i < kids.length; i++) walk(kids[i], depth + 1) }
-            }
-            for (var j = 0; j < rl.length; j++) walk(rl[j], 0)
-        }
-        // re-sort/reorder only while at the top; when scrolled, freeze the order so
-        // the viewport doesn't shift under you (values + membership still update)
-        var lv = root.rowsViewRef
-        if (!lv || lv.contentY < Kirigami.Units.gridUnit * 1.7)
-            root.syncModel(desired)
-        else
-            root.syncFrozen(desired)
-    }
+    // ---- reconcile rowModel against the worker's flat row list ----
+    // The parse + history + tree-walk run off-thread in proc.worker.mjs; these
+    // syncs only diff the small {pid,depth,hasChildren,expanded} rows against the
+    // model (cheap, GUI-thread). Cell values come from procByPid (re-looked-up in
+    // the delegate), so they update without the model touching them.
+    //
     // keep current row order; just update tree fields, drop gone rows, append new
     // ones at the end (no moves -> no scroll jump while the user is scrolled)
     function syncFrozen(desired) {
@@ -305,16 +257,16 @@ PlasmoidItem {
             }
         }
     }
-    function toggle(pid) { var e = root.expanded; e[pid] = !e[pid]; root.expanded = e; rebuild() }
-    function collapseAll() { root.expanded = ({}); rebuild() }
+    function toggle(pid) { var e = root.expanded; e[pid] = !e[pid]; root.expanded = e; requestRebuild() }
+    function collapseAll() { root.expanded = ({}); requestRebuild() }
     function applySort(col, desc) {
         root.sortColumn = col; root.sortDescending = desc
         Plasmoid.configuration.sortColumn = col; Plasmoid.configuration.sortDescending = desc
-        rebuild()
+        requestRebuild()
     }
     function headerSort(col) { applySort(col, root.sortColumn === col ? !root.sortDescending : (col !== "name")) }
-    onSearchTextChanged: rebuild()
-    onShowKernelChanged: rebuild()
+    onSearchTextChanged: requestRebuild()
+    onShowKernelChanged: requestRebuild()
 
     // clickable, sort-aware column header
     component HeaderCell: Item {
@@ -429,7 +381,7 @@ PlasmoidItem {
                     required property bool expanded
                     // proc data looked up live -> updates in place when byPid refreshes,
                     // without recreating the delegate
-                    readonly property var rowProc: root.byPid[pid] || ({})
+                    readonly property var rowProc: root.procByPid[pid] || ({})
                     width: rowsView.width
                     height: Kirigami.Units.gridUnit * 1.7
                     // zebra striping (matches the System Log), hover highlight on top
@@ -442,7 +394,7 @@ PlasmoidItem {
                         anchors.topMargin: 1; anchors.bottomMargin: 1
                         z: -1
                         visible: root.sortColumn !== "name" && root.sortColumn !== "pid"
-                        values: root.histFor(rowItem.pid, root.sortColumn)
+                        values: root.sortHistByPid[rowItem.pid] || []
                         rangeMax: root.graphMax(root.sortColumn)
                         lineColor: Kirigami.Theme.highlightColor
                         peakMarker: false        // behind-text decoration; no label
