@@ -31,6 +31,15 @@ CLK = os.sysconf("SC_CLK_TCK")
 PAGE = os.sysconf("SC_PAGE_SIZE")
 NCPU = os.cpu_count() or 1
 
+MEM_TOTAL = 0
+try:
+    for _ln in open("/proc/meminfo"):
+        if _ln.startswith("MemTotal:"):
+            MEM_TOTAL = int(_ln.split()[1]) * 1024          # kB -> bytes
+            break
+except OSError:
+    pass
+
 # metrics aggregated up the tree (self + descendants); pid/ppid are not summed
 SUM_KEYS = ["cpu", "ram", "gpu", "dec", "enc", "vram", "disk", "threads"]
 
@@ -180,7 +189,23 @@ def read_io():
     return out
 
 
-_nvml = {"init": False, "h": None, "ts": 0, "util": {}}
+_nvml = {"init": False, "h": None, "ts": 0, "util": {}, "vram_total": 0}
+
+
+def vram_total():
+    """Total VRAM bytes via NVML (cached); 0 when no NVIDIA/NVML."""
+    if _nvml["vram_total"]:
+        return _nvml["vram_total"]
+    try:
+        import pynvml as N
+        if not _nvml["init"]:
+            N.nvmlInit()
+            _nvml["h"] = N.nvmlDeviceGetHandleByIndex(0)
+            _nvml["init"] = True
+        _nvml["vram_total"] = N.nvmlDeviceGetMemoryInfo(_nvml["h"]).total
+    except Exception:
+        pass
+    return _nvml["vram_total"]
 
 
 def gpu_usage():
@@ -251,7 +276,8 @@ def build():
     _prev["t"] = {pid: p["t"] for pid, p in procs.items()}
     _prev["io"] = io
     _prev["when"] = now
-    return {"ts": now, "ncpu": NCPU, "procs": rows}
+    return {"ts": now, "ncpu": NCPU, "mem_total": MEM_TOTAL,
+            "vram_total": vram_total(), "procs": rows}
 
 
 def aggregate(rows):

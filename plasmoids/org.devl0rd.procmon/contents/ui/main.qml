@@ -49,11 +49,17 @@ PlasmoidItem {
     // ---- data ----
     property var procs: []
     property int ncpu: 1
+    property real memTotal: 0             // system RAM total -> RAM sparkline max
+    property real vramTotal: 0            // GPU VRAM total -> VRAM sparkline max
     property var byPid: ({})
     property var childrenOf: ({})
     property var expanded: ({})           // pid -> true when expanded (default: collapsed)
-    property var visibleRows: []
-    property var rowsViewRef: null        // set by the ListView so root code can read its scroll
+
+    // the visible rows live in a ListModel that is reconciled in place each poll
+    // (insert/move/set/remove keyed by pid) so delegates PERSIST and only changed
+    // values update -- no destroying/recreating the whole list every refresh
+    ListModel { id: rowModel }
+    property var rowsViewRef: null        // ListView ref (read-only, for scroll state)
 
     // per-PID metric history, accumulated for EVERY process each poll (data layer,
     // independent of what's rendered) so a row's sparkline is complete the moment
@@ -62,7 +68,14 @@ PlasmoidItem {
     readonly property int histLen: 40
     readonly property var histKeys: ["cpu", "ram", "gpu", "dec", "enc", "vram", "disk", "threads"]
     function histFor(pid, col) { var h = root.hist[pid]; return (h && h[col]) ? h[col] : [] }
-    function graphMax(col) { var c = root.colOf(col); return (c && c.kind === "pct") ? 100 : 0 }
+    // each metric's natural ceiling: CPU/GPU/DEC/ENC = 100, RAM = total RAM,
+    // VRAM = total VRAM, disk/threads = auto-scale
+    function graphMax(col) {
+        if (col === "ram") return root.memTotal
+        if (col === "vram") return root.vramTotal
+        var c = root.colOf(col)
+        return (c && c.kind === "pct") ? 100 : 0
+    }
 
     property string searchText: ""
     property string sortColumn: Plasmoid.configuration.sortColumn || "cpu"
@@ -129,6 +142,8 @@ PlasmoidItem {
             ;(ch[q.ppid] = ch[q.ppid] || []).push(q.pid)
         }
         root.ncpu = d.ncpu || 1
+        root.memTotal = d.mem_total || 0
+        root.vramTotal = d.vram_total || 0
         root.procs = ps; root.byPid = bp; root.childrenOf = ch
         // accumulate history for every process (aggregate-aware), dropping dead PIDs
         var keys = root.histKeys
@@ -213,14 +228,15 @@ PlasmoidItem {
         return par === undefined || root.isHidden(par) || !root.passes(par)
     }
     function rebuild() {
-        var lv = root.rowsViewRef
-        var keepY = lv ? lv.contentY : 0
-        var rows = []
+        // build the desired flat list of visible rows (pid + tree fields only;
+        // the proc data is looked up live in the delegate via byPid)
+        var desired = []
         if (root.searchText !== "") {
             var ql = root.searchText.toLowerCase()
             var m = root.procs.filter(function(p) { return root.passes(p) && (p.name || "").toLowerCase().indexOf(ql) >= 0 })
             m.sort(root.cmp)
-            for (var i = 0; i < m.length; i++) rows.push({ proc: m[i], depth: 0, hasChildren: false, expanded: false })
+            for (var i = 0; i < m.length; i++)
+                desired.push({ pid: m[i].pid, depth: 0, hasChildren: false, expanded: false })
         } else {
             var rl = root.procs.filter(root.displayRoot)
             rl.sort(root.cmp)
@@ -229,16 +245,65 @@ PlasmoidItem {
                     .filter(function(k) { return k && root.passes(k) && !root.isHidden(k) })
                 var has = kids.length > 0
                 var exp = root.expanded[p.pid] === true
-                rows.push({ proc: p, depth: depth, hasChildren: has, expanded: exp })
+                desired.push({ pid: p.pid, depth: depth, hasChildren: has, expanded: exp })
                 if (has && exp) { kids.sort(root.cmp); for (var i = 0; i < kids.length; i++) walk(kids[i], depth + 1) }
             }
             for (var j = 0; j < rl.length; j++) walk(rl[j], 0)
         }
-        root.visibleRows = rows
-        // keep the viewport where it was, instead of snapping to the top each refresh
-        if (lv) Qt.callLater(function() {
-            lv.contentY = Math.max(0, Math.min(keepY, lv.contentHeight - lv.height))
-        })
+        // re-sort/reorder only while at the top; when scrolled, freeze the order so
+        // the viewport doesn't shift under you (values + membership still update)
+        var lv = root.rowsViewRef
+        if (!lv || lv.contentY < Kirigami.Units.gridUnit * 1.7)
+            root.syncModel(desired)
+        else
+            root.syncFrozen(desired)
+    }
+    // keep current row order; just update tree fields, drop gone rows, append new
+    // ones at the end (no moves -> no scroll jump while the user is scrolled)
+    function syncFrozen(desired) {
+        var want = {}, map = {}
+        for (var i = 0; i < desired.length; i++) { want[desired[i].pid] = true; map[desired[i].pid] = desired[i] }
+        for (var r = rowModel.count - 1; r >= 0; r--)
+            if (want[rowModel.get(r).pid] !== true) rowModel.remove(r)
+        var have = {}
+        for (var x = 0; x < rowModel.count; x++) {
+            var m = rowModel.get(x); have[m.pid] = true
+            var d = map[m.pid]
+            if (d && (m.depth !== d.depth || m.hasChildren !== d.hasChildren || m.expanded !== d.expanded))
+                rowModel.set(x, d)
+        }
+        for (var j = 0; j < desired.length; j++)
+            if (have[desired[j].pid] !== true) rowModel.append(desired[j])
+    }
+    // reconcile rowModel in place to match `desired`, keyed by pid: O(n) when the
+    // order is stable (fast path); otherwise insert/move/set/remove only the diff.
+    // Detecting removed/new rows is O(n) via the want-set + position scan.
+    function syncModel(desired) {
+        var n = desired.length
+        var want = {}
+        for (var i = 0; i < n; i++) want[desired[i].pid] = true
+        for (var r = rowModel.count - 1; r >= 0; r--)        // drop gone rows
+            if (want[rowModel.get(r).pid] !== true) rowModel.remove(r)
+        for (var pos = 0; pos < n; pos++) {
+            var d = desired[pos]
+            if (pos < rowModel.count && rowModel.get(pos).pid === d.pid) {
+                var a = rowModel.get(pos)                     // already in place
+                if (a.depth !== d.depth || a.hasChildren !== d.hasChildren || a.expanded !== d.expanded)
+                    rowModel.set(pos, d)
+                continue
+            }
+            var cur = -1
+            for (var x = pos + 1; x < rowModel.count; x++)
+                if (rowModel.get(x).pid === d.pid) { cur = x; break }
+            if (cur < 0) {
+                rowModel.insert(pos, d)                       // new row
+            } else {
+                rowModel.move(cur, pos, 1)                    // moved row
+                var b = rowModel.get(pos)
+                if (b.depth !== d.depth || b.hasChildren !== d.hasChildren || b.expanded !== d.expanded)
+                    rowModel.set(pos, d)
+            }
+        }
     }
     function toggle(pid) { var e = root.expanded; e[pid] = !e[pid]; root.expanded = e; rebuild() }
     function collapseAll() { root.expanded = ({}); rebuild() }
@@ -349,14 +414,22 @@ PlasmoidItem {
                 Layout.fillHeight: true
                 clip: true
                 reuseItems: true
-                model: root.visibleRows
+                cacheBuffer: Kirigami.Units.gridUnit * 20   // small offscreen cache, less churn
+                model: rowModel
                 boundsBehavior: Flickable.StopAtBounds
                 QQC2.ScrollBar.vertical: QQC2.ScrollBar {}
                 Component.onCompleted: root.rowsViewRef = rowsView
 
                 delegate: Rectangle {
                     id: rowItem
-                    property var rowProc: modelData.proc
+                    required property int index
+                    required property int pid
+                    required property int depth
+                    required property bool hasChildren
+                    required property bool expanded
+                    // proc data looked up live -> updates in place when byPid refreshes,
+                    // without recreating the delegate
+                    readonly property var rowProc: root.byPid[pid] || ({})
                     width: rowsView.width
                     height: Kirigami.Units.gridUnit * 1.7
                     // zebra striping (matches the System Log), hover highlight on top
@@ -369,9 +442,10 @@ PlasmoidItem {
                         anchors.topMargin: 1; anchors.bottomMargin: 1
                         z: -1
                         visible: root.sortColumn !== "name" && root.sortColumn !== "pid"
-                        values: root.histFor(rowItem.rowProc.pid, root.sortColumn)
+                        values: root.histFor(rowItem.pid, root.sortColumn)
                         rangeMax: root.graphMax(root.sortColumn)
                         lineColor: Kirigami.Theme.highlightColor
+                        peakMarker: false        // behind-text decoration; no label
                         opacity: 0.55
                     }
                     RowLayout {
@@ -383,28 +457,28 @@ PlasmoidItem {
                         RowLayout {
                             Layout.fillWidth: true
                             spacing: 0
-                            Item { Layout.preferredWidth: modelData.depth * Kirigami.Units.gridUnit; Layout.fillHeight: true }
+                            Item { Layout.preferredWidth: rowItem.depth * Kirigami.Units.gridUnit; Layout.fillHeight: true }
                             QQC2.ToolButton {
-                                visible: modelData.hasChildren
+                                visible: rowItem.hasChildren
                                 Layout.preferredWidth: Kirigami.Units.gridUnit * 1.3
                                 Layout.preferredHeight: Kirigami.Units.gridUnit * 1.3
                                 flat: true
-                                icon.name: modelData.expanded ? "go-down-symbolic" : "go-next-symbolic"
-                                onClicked: root.toggle(modelData.proc.pid)
+                                icon.name: rowItem.expanded ? "go-down-symbolic" : "go-next-symbolic"
+                                onClicked: root.toggle(rowItem.pid)
                             }
-                            Item { visible: !modelData.hasChildren; Layout.preferredWidth: Kirigami.Units.gridUnit * 1.3 }
+                            Item { visible: !rowItem.hasChildren; Layout.preferredWidth: Kirigami.Units.gridUnit * 1.3 }
                             Kirigami.Icon {
                                 Layout.preferredWidth: Kirigami.Units.iconSizes.small
                                 Layout.preferredHeight: Kirigami.Units.iconSizes.small
                                 Layout.rightMargin: Kirigami.Units.smallSpacing
                                 // resolved .desktop icon if we found one, else the bare
                                 // process name, else a generic executable glyph
-                                source: modelData.proc.icon ? modelData.proc.icon : modelData.proc.name
+                                source: rowItem.rowProc.icon ? rowItem.rowProc.icon : (rowItem.rowProc.name || "application-x-executable")
                                 fallback: "application-x-executable"
                             }
                             PlasmaComponents.Label {
                                 Layout.fillWidth: true
-                                text: modelData.proc.name
+                                text: rowItem.rowProc.name || ""
                                 elide: Text.ElideRight
                                 verticalAlignment: Text.AlignVCenter
                             }
@@ -435,7 +509,7 @@ PlasmoidItem {
 
             PlasmaComponents.Label {
                 Layout.alignment: Qt.AlignHCenter
-                visible: root.visibleRows.length === 0
+                visible: rowModel.count === 0
                 text: root.searchText !== "" ? i18n("No matching processes") : i18n("Loading…")
                 opacity: 0.5
             }
