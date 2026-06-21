@@ -20,7 +20,7 @@ Modes:
   procmon-collect --snapshot   print the cached snapshot (debug / fallback)
   procmon-collect --once       one sample to stdout (debug)
 """
-import os, sys, json, time, glob, shutil, subprocess
+import os, sys, json, time, glob
 
 APP = "Linux-Process-Mon"
 RUNDIR = os.path.join(os.environ.get("XDG_RUNTIME_DIR", "/tmp"), APP)
@@ -180,41 +180,44 @@ def read_io():
     return out
 
 
+_nvml = {"init": False, "h": None, "ts": 0, "util": {}}
+
+
 def gpu_usage():
-    """pid -> {gpu, enc, dec (%), vram (bytes)} from nvidia-smi pmon (best-effort).
-    Parses the header line so column order can't bite us."""
-    exe = shutil.which("nvidia-smi")
-    if not exe:
-        return {}
+    """pid -> {gpu, enc, dec (%), vram (bytes)} via NVML -- no fork, ~4ms. Empty
+    when there is no NVIDIA GPU / NVML present."""
     try:
-        out = subprocess.run([exe, "pmon", "-c", "1", "-s", "um"],
-                             capture_output=True, text=True, timeout=8).stdout
+        import pynvml as N
     except Exception:
         return {}
-    cols, res = None, {}
-    for line in out.splitlines():
-        s = line.strip()
-        if not s:
-            continue
-        if s.startswith("#"):
-            parts = s.lstrip("#").split()
-            if "pid" in parts:
-                cols = parts                               # the names header
-            continue
-        if cols is None:
-            continue
-        row = dict(zip(cols, s.split()))
+    try:
+        if not _nvml["init"]:
+            N.nvmlInit()
+            _nvml["h"] = N.nvmlDeviceGetHandleByIndex(0)
+            _nvml["init"] = True
+        h = _nvml["h"]
+        util = _nvml["util"]                              # pid -> (sm, enc, dec), cached
         try:
-            pid = int(row.get("pid", ""))
-        except ValueError:
-            continue
-
-        def num(k):
-            v = row.get(k, "-")
-            return int(v) if v.isdigit() else 0
-        res[pid] = {"gpu": num("sm"), "enc": num("enc"), "dec": num("dec"),
-                    "vram": num("fb") * 1024 * 1024}       # fb is MB
-    return res
+            for su in N.nvmlDeviceGetProcessUtilization(h, _nvml["ts"]):
+                util[su.pid] = (su.smUtil, su.encUtil, su.decUtil)
+                if su.timeStamp > _nvml["ts"]:
+                    _nvml["ts"] = su.timeStamp
+        except N.NVMLError:
+            pass                                          # no new samples -> keep cache
+        running = (N.nvmlDeviceGetComputeRunningProcesses(h)
+                   + N.nvmlDeviceGetGraphicsRunningProcesses(h))
+        res = {}
+        for p in running:
+            g = util.get(p.pid, (0, 0, 0))
+            res[p.pid] = {"gpu": g[0], "enc": g[1], "dec": g[2], "vram": (p.usedGpuMemory or 0)}
+        for pid, g in util.items():
+            if pid not in res:
+                res[pid] = {"gpu": g[0], "enc": g[1], "dec": g[2], "vram": 0}
+        rp = set(p.pid for p in running)
+        _nvml["util"] = {pid: g for pid, g in util.items() if pid in rp}
+        return res
+    except Exception:
+        return {}
 
 
 _prev = {"t": {}, "io": {}, "when": None}

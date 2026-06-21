@@ -14,6 +14,7 @@ CFG_DIR="$HOME/.config/Linux-Process-Mon"
 for bin in python3 kpackagetool6; do
     command -v "$bin" >/dev/null 2>&1 || echo "Warning: '$bin' is not installed or not in PATH."
 done
+python3 -c "import pynvml" >/dev/null 2>&1 || echo "Note: install python-nvidia-ml-py for GPU stats:  sudo pacman -S python-nvidia-ml-py"
 
 # --- 1. collector onto PATH (symlinked back to the repo) ---
 mkdir -p "$BIN_DIR"
