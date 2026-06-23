@@ -192,7 +192,12 @@ def read_io():
     return out
 
 
-_nvml = {"init": False, "h": None, "ts": 0, "util": {}, "vram_total": 0}
+# current GPU poll interval (seconds); cmd_serve keeps this fresh. Used only to
+# size the per-process utilization look-back so each poll reflects the activity
+# since the previous one (NVIDIA gives samples, not an instantaneous figure).
+_poll_interval = 2.0
+
+_nvml = {"init": False, "h": None, "vram_total": 0}
 
 
 def vram_total():
@@ -212,8 +217,11 @@ def vram_total():
 
 
 def gpu_usage():
-    """pid -> {gpu, enc, dec (%), vram (bytes)} via NVML -- no fork, ~4ms. Empty
-    when there is no NVIDIA GPU / NVML present."""
+    """pid -> {gpu, enc, dec (%), vram (bytes)} via NVML -- no fork, ~4ms. NVIDIA's
+    per-process utilization is sample-based (there is no instantaneous figure), so
+    each poll reports the samples in the look-back window ending now -- newest per
+    pid. No cross-poll state: a process that didn't touch the GPU in that window
+    reads 0, like the /proc metrics. Empty when no NVIDIA GPU / NVML present."""
     try:
         import pynvml as N
     except Exception:
@@ -224,25 +232,26 @@ def gpu_usage():
             _nvml["h"] = N.nvmlDeviceGetHandleByIndex(0)
             _nvml["init"] = True
         h = _nvml["h"]
-        util = _nvml["util"]                              # pid -> (sm, enc, dec), cached
+        # cover the gap since the previous poll (+ margin for NVML's sampling jitter)
+        # so nothing active is missed; timeStamp is unix microseconds.
+        since = int((time.time() - max(1.0, _poll_interval + 0.5)) * 1e6)
+        latest = {}                                      # pid -> (ts, sm, enc, dec)
         try:
-            for su in N.nvmlDeviceGetProcessUtilization(h, _nvml["ts"]):
-                util[su.pid] = (su.smUtil, su.encUtil, su.decUtil)
-                if su.timeStamp > _nvml["ts"]:
-                    _nvml["ts"] = su.timeStamp
+            for su in N.nvmlDeviceGetProcessUtilization(h, since):
+                cur = latest.get(su.pid)
+                if cur is None or su.timeStamp > cur[0]:
+                    latest[su.pid] = (su.timeStamp, su.smUtil, su.encUtil, su.decUtil)
         except N.NVMLError:
-            pass                                          # no new samples -> keep cache
-        running = (N.nvmlDeviceGetComputeRunningProcesses(h)
-                   + N.nvmlDeviceGetGraphicsRunningProcesses(h))
+            pass                                          # no samples in window -> all idle
         res = {}
-        for p in running:
-            g = util.get(p.pid, (0, 0, 0))
-            res[p.pid] = {"gpu": g[0], "enc": g[1], "dec": g[2], "vram": (p.usedGpuMemory or 0)}
-        for pid, g in util.items():
+        for p in (N.nvmlDeviceGetComputeRunningProcesses(h)
+                  + N.nvmlDeviceGetGraphicsRunningProcesses(h)):
+            s = latest.get(p.pid)
+            res[p.pid] = {"gpu": s[1] if s else 0, "enc": s[2] if s else 0,
+                          "dec": s[3] if s else 0, "vram": (p.usedGpuMemory or 0)}
+        for pid, s in latest.items():                    # active but no VRAM-residency entry
             if pid not in res:
-                res[pid] = {"gpu": g[0], "enc": g[1], "dec": g[2], "vram": 0}
-        rp = set(p.pid for p in running)
-        _nvml["util"] = {pid: g for pid, g in util.items() if pid in rp}
+                res[pid] = {"gpu": s[1], "enc": s[2], "dec": s[3], "vram": 0}
         return res
     except Exception:
         return {}
@@ -345,9 +354,11 @@ def cmd_serve():
     time.sleep(0.5)                                        # real delta before first write
     write_snapshot(build())
     last = time.time()
+    global _poll_interval
     while True:
         # re-read config every loop so a new poll_interval applies within ~0.2s
         interval = max(0.25, float(load_config().get("poll_interval", 2)))
+        _poll_interval = interval                          # size the GPU look-back to it
         elapsed = time.time() - last
         if elapsed >= interval:
             last = time.time()

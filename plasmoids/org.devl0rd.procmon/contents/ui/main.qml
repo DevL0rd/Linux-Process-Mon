@@ -159,11 +159,12 @@ PlasmoidItem {
                 root.syncFrozen(msg.desired)
         }
     }
-    Timer {
-        interval: Math.max(500, Plasmoid.configuration.updateInterval)
-        repeat: true
-        running: true
-        onTriggered: root.read()
+    // event-driven: re-read the instant the collector rewrites the snapshot (no
+    // polling). The collector's own sample rate (updateInterval, applied below)
+    // sets how often that happens.
+    FileWatcher {
+        path: root.cachePath
+        onChanged: root.read()
     }
     Component.onCompleted: {
         pathHelper.connectSource("printf %s \"$XDG_RUNTIME_DIR/Linux-Process-Mon/data.json\"")
