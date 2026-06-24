@@ -10,3 +10,7 @@ __pycache__/
 .idea/
 *.swp
 .DS_Store
+
+# Shared QML components synced from the shared/common submodule by install.sh
+plasmoids/org.devl0rd.procmon/contents/ui/FileWatcher.qml
+plasmoids/org.devl0rd.procmon/contents/ui/Sparkline.qml

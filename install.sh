@@ -61,8 +61,14 @@ systemctl --user enable --now linux-process-mon.service >/dev/null 2>&1 \
     || echo "  (could not enable linux-process-mon.service -- enable it manually)"
 
 # --- 5. install the widget ---
+if [ ! -e "$REPO_DIR/shared/common/FileWatcher.qml" ]; then
+    echo "  ! shared/common (Linux-Plasma-Shared submodule) is empty." >&2
+    echo "    Run: git submodule update --init --recursive" >&2
+    exit 1
+fi
 echo "Installing widget..."
 for d in "$PLASMOID_SRC"/org.devl0rd.procmon*; do
+    cp "$REPO_DIR/shared/common/FileWatcher.qml" "$REPO_DIR/shared/common/Sparkline.qml" "$d/contents/ui/"  # shared (submodule) components
     if kpackagetool6 -t Plasma/Applet -u "$d" >/dev/null 2>&1; then
         echo "  upgraded $(basename "$d")"
     else

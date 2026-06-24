@@ -26,8 +26,13 @@ GPU usage is **per-process NVIDIA SM utilisation** from `nvidia-smi pmon`
 
 ## Install
 
+Clone **with submodules** — the shared QML components live in the
+[Linux-Plasma-Shared](https://github.com/DevL0rd/Linux-Plasma-Shared) submodule:
+
 ```sh
+git clone --recurse-submodules https://github.com/DevL0rd/Linux-Process-Mon.git
 cd Linux-Process-Mon
+# already cloned without it?  git submodule update --init --recursive
 ./install.sh
 ```
 
